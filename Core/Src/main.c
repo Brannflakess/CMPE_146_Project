@@ -1,4 +1,5 @@
 #include "main.h"
+#include "oled_ssd1306.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,9 +23,9 @@ int __io_putchar(int ch)
 }
 
 /* MPU-6050 definitions ------------------------------------------------------*/
-#define MPU6050_ADDR            (0x68 << 1)
-#define MPU6050_REG_WHO_AM_I    0x75
-#define MPU6050_REG_PWR_MGMT_1  0x6B
+#define MPU6050_ADDR (0x68 << 1)
+#define MPU6050_REG_WHO_AM_I 0x75
+#define MPU6050_REG_PWR_MGMT_1 0x6B
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B
 
 /* Squat counter settings ----------------------------------------------------*/
@@ -38,14 +39,14 @@ int __io_putchar(int ch)
  * - the chosen axis DECREASES when going down
  * - the chosen axis INCREASES when coming back up
  */
-#define FILTER_SIZE             5
-#define SAMPLE_DELAY_MS         100
-#define REP_LOCKOUT_MS          1200
+#define FILTER_SIZE 5
+#define SAMPLE_DELAY_MS 100
+#define REP_LOCKOUT_MS 1200
 
-#define STAND_THRESHOLD         15000
-#define DOWN_THRESHOLD          13800
-#define BOTTOM_THRESHOLD        12800
-#define UP_THRESHOLD            13800
+#define STAND_THRESHOLD 15000
+#define DOWN_THRESHOLD 13800
+#define BOTTOM_THRESHOLD 12800
+#define UP_THRESHOLD 13800
 
 typedef enum
 {
@@ -65,7 +66,7 @@ HAL_StatusTypeDef MPU6050_Init(void);
 HAL_StatusTypeDef MPU6050_ReadAccelRaw(int16_t *ax, int16_t *ay, int16_t *az);
 int MovingAverage_Update(int new_value);
 void Squat_Update(int value, uint32_t now_ms);
-const char* SquatState_ToString(SquatState state);
+const char *SquatState_ToString(SquatState state);
 
 /* Moving average buffer -----------------------------------------------------*/
 static int filter_buffer[FILTER_SIZE] = {0};
@@ -168,7 +169,8 @@ int MovingAverage_Update(int new_value)
     else
     {
         int count = filter_index;
-        if (count == 0) count = 1;
+        if (count == 0)
+            count = 1;
         return filter_sum / count;
     }
 }
@@ -177,66 +179,71 @@ void Squat_Update(int value, uint32_t now_ms)
 {
     switch (squat_state)
     {
-        case STATE_STANDING:
-            if (value < DOWN_THRESHOLD)
-            {
-                squat_state = STATE_GOING_DOWN;
-                printf("STATE -> GOING_DOWN\r\n");
-            }
-            break;
+    case STATE_STANDING:
+        if (value < DOWN_THRESHOLD)
+        {
+            squat_state = STATE_GOING_DOWN;
+            printf("STATE -> GOING_DOWN\r\n");
+        }
+        break;
 
-        case STATE_GOING_DOWN:
-            if (value < BOTTOM_THRESHOLD)
-            {
-                squat_state = STATE_BOTTOM;
-                printf("STATE -> BOTTOM\r\n");
-            }
-            else if (value > STAND_THRESHOLD)
-            {
-                /* Went back up before completing a squat */
-                squat_state = STATE_STANDING;
-                printf("STATE -> STANDING (reset)\r\n");
-            }
-            break;
-
-        case STATE_BOTTOM:
-            if (value > UP_THRESHOLD)
-            {
-                squat_state = STATE_GOING_UP;
-                printf("STATE -> GOING_UP\r\n");
-            }
-            break;
-
-        case STATE_GOING_UP:
-            if (value > STAND_THRESHOLD)
-            {
-                if ((now_ms - last_rep_time) > REP_LOCKOUT_MS)
-                {
-                    squat_count++;
-                    last_rep_time = now_ms;
-                    printf("SQUAT COUNT = %lu\r\n", (unsigned long)squat_count);
-                }
-
-                squat_state = STATE_STANDING;
-                printf("STATE -> STANDING\r\n");
-            }
-            break;
-
-        default:
+    case STATE_GOING_DOWN:
+        if (value < BOTTOM_THRESHOLD)
+        {
+            squat_state = STATE_BOTTOM;
+            printf("STATE -> BOTTOM\r\n");
+        }
+        else if (value > STAND_THRESHOLD)
+        {
+            /* Went back up before completing a squat */
             squat_state = STATE_STANDING;
-            break;
+            printf("STATE -> STANDING (reset)\r\n");
+        }
+        break;
+
+    case STATE_BOTTOM:
+        if (value > UP_THRESHOLD)
+        {
+            squat_state = STATE_GOING_UP;
+            printf("STATE -> GOING_UP\r\n");
+        }
+        break;
+
+    case STATE_GOING_UP:
+        if (value > STAND_THRESHOLD)
+        {
+            if ((now_ms - last_rep_time) > REP_LOCKOUT_MS)
+            {
+                squat_count++;
+                last_rep_time = now_ms;
+                printf("SQUAT COUNT = %lu\r\n", (unsigned long)squat_count);
+            }
+
+            squat_state = STATE_STANDING;
+            printf("STATE -> STANDING\r\n");
+        }
+        break;
+
+    default:
+        squat_state = STATE_STANDING;
+        break;
     }
 }
 
-const char* SquatState_ToString(SquatState state)
+const char *SquatState_ToString(SquatState state)
 {
     switch (state)
     {
-        case STATE_STANDING:   return "STANDING";
-        case STATE_GOING_DOWN: return "GOING_DOWN";
-        case STATE_BOTTOM:     return "BOTTOM";
-        case STATE_GOING_UP:   return "GOING_UP";
-        default:               return "UNKNOWN";
+    case STATE_STANDING:
+        return "STANDING";
+    case STATE_GOING_DOWN:
+        return "GOING_DOWN";
+    case STATE_BOTTOM:
+        return "BOTTOM";
+    case STATE_GOING_UP:
+        return "GOING_UP";
+    default:
+        return "UNKNOWN";
     }
 }
 
@@ -249,9 +256,22 @@ int main(void)
     MX_I2C1_Init();
     MX_USART2_UART_Init();
 
+    /* Initialize OLED SSD1306 Display */
+    OLED_Init(&hi2c1);
+    
+    /* Display welcome message on OLED */
+    OLED_Clear();
+    OLED_WriteLine(0, "Hello Guys!");
+    OLED_WriteLine(1, "Squat Counter");
+    OLED_WriteLine(3, "Initializing...");
+    OLED_Display();
+
     if (MPU6050_Init() != HAL_OK)
     {
         printf("MPU init failed. Stopping.\r\n");
+        OLED_Clear();
+        OLED_WriteLine(0, "MPU Init Failed!");
+        OLED_Display();
         while (1)
         {
             HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
@@ -316,9 +336,9 @@ int main(void)
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
+ * @brief System Clock Configuration
+ * @retval None
+ */
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -336,8 +356,7 @@ void SystemClock_Config(void)
         Error_Handler();
     }
 
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                                | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
     RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
     RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
@@ -350,10 +369,10 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
-  */
+ * @brief I2C1 Initialization Function
+ * @param None
+ * @retval None
+ */
 static void MX_I2C1_Init(void)
 {
     hi2c1.Instance = I2C1;
@@ -373,10 +392,10 @@ static void MX_I2C1_Init(void)
 }
 
 /**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
+ * @brief USART2 Initialization Function
+ * @param None
+ * @retval None
+ */
 static void MX_USART2_UART_Init(void)
 {
     huart2.Instance = USART2;
@@ -395,10 +414,10 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -416,9 +435,9 @@ static void MX_GPIO_Init(void)
 }
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
 void Error_Handler(void)
 {
     __disable_irq();
