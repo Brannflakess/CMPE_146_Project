@@ -1,4 +1,6 @@
 #include "oled_ssd1306.h"
+#include <stdio.h>          // ← ADD THIS
+
 
 /* Global OLED structure */
 static OLED_t oled;
