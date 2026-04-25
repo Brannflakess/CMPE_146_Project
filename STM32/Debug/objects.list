@@ -1,5 +1,5 @@
-"./Core/Src/lcd_1602a.o"
 "./Core/Src/main.o"
+"./Core/Src/oled_ssd1306.o"
 "./Core/Src/stm32f4xx_hal_msp.o"
 "./Core/Src/stm32f4xx_it.o"
 "./Core/Src/syscalls.o"

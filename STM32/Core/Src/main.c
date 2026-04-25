@@ -1,9 +1,9 @@
 #include "main.h"
-#include "oled_ssd1306.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include "oled_ssd1306.h"
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
@@ -11,6 +11,7 @@ UART_HandleTypeDef huart2;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void OLED_UpdateScreen(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
@@ -23,64 +24,143 @@ int __io_putchar(int ch)
 }
 
 /* MPU-6050 definitions ------------------------------------------------------*/
-#define MPU6050_ADDR (0x68 << 1)
-#define MPU6050_REG_WHO_AM_I 0x75
-#define MPU6050_REG_PWR_MGMT_1 0x6B
-#define MPU6050_REG_ACCEL_XOUT_H 0x3B
+#define MPU6050_ADDR              (0x68 << 1)
+#define MPU6050_REG_WHO_AM_I      0x75
+#define MPU6050_REG_PWR_MGMT_1    0x6B
+#define MPU6050_REG_ACCEL_XOUT_H  0x3B
 
-/* Squat counter settings ----------------------------------------------------*/
+/* General settings ----------------------------------------------------------*/
+#define FILTER_SIZE               5
+#define SAMPLE_DELAY_MS           80
+#define MODE_LOCK_MS              600
+
+/* -------------------------------------------------------------------------- */
+/* EXERCISE MODE DETECTION                                                    */
+/* -------------------------------------------------------------------------- */
 /*
- * IMPORTANT:
- * These threshold values are placeholders.
- * You will almost certainly need to tune them after testing on your chest.
+ * Assumption for chest-mounted vertical board:
  *
- * For now, this code assumes:
- * - AZ is the main squat axis
- * - the chosen axis DECREASES when going down
- * - the chosen axis INCREASES when coming back up
+ * - Standing upright for squats:
+ *     |AY| tends to be large (near 1g), while |AZ| is smaller
+ *
+ * - Horizontal body position for push-ups:
+ *     |AZ| tends to be large (near 1g), while |AY| is smaller
+ *
+ * These values are placeholders and should be tuned from real logs.
  */
-#define FILTER_SIZE 5
-#define SAMPLE_DELAY_MS 100
-#define REP_LOCKOUT_MS 1200
-
-#define STAND_THRESHOLD 15000
-#define DOWN_THRESHOLD 13800
-#define BOTTOM_THRESHOLD 12800
-#define UP_THRESHOLD 13800
+#define MODE_GRAVITY_HIGH         13000
+#define MODE_GRAVITY_LOW          9000
 
 typedef enum
 {
-    STATE_STANDING = 0,
-    STATE_GOING_DOWN,
-    STATE_BOTTOM,
-    STATE_GOING_UP
+    EXERCISE_UNKNOWN = 0,
+    EXERCISE_SQUAT,
+    EXERCISE_PUSHUP
+} ExerciseMode;
+
+/* -------------------------------------------------------------------------- */
+/* SQUAT SETTINGS                                                             */
+/* -------------------------------------------------------------------------- */
+/*
+ * These are based on your existing squat structure.
+ * Since your previous code was using AY as the actual raw axis, we keep AY.
+ */
+#define SQUAT_REP_LOCKOUT_MS      1200
+#define SQUAT_STAND_THRESHOLD     15000
+#define SQUAT_DOWN_THRESHOLD      13800
+#define SQUAT_BOTTOM_THRESHOLD    12800
+#define SQUAT_UP_THRESHOLD        13800
+
+typedef enum
+{
+    SQUAT_STATE_STANDING = 0,
+    SQUAT_STATE_GOING_DOWN,
+    SQUAT_STATE_BOTTOM,
+    SQUAT_STATE_GOING_UP
 } SquatState;
 
-/* Global squat state --------------------------------------------------------*/
-static SquatState squat_state = STATE_STANDING;
+/* -------------------------------------------------------------------------- */
+/* PUSH-UP SETTINGS                                                           */
+/* -------------------------------------------------------------------------- */
+/*
+ * Start with AZ for push-ups.
+ * Assumption:
+ * - Value rises as chest goes DOWN
+ * - Value falls as chest pushes UP
+ *
+ * Tune these from real serial logs.
+ */
+#define PUSHUP_REP_LOCKOUT_MS      900
+
+#define PUSHUP_TOP_THRESHOLD      -16500
+#define PUSHUP_DOWN_THRESHOLD     -15500
+#define PUSHUP_BOTTOM_THRESHOLD   -14200
+#define PUSHUP_UP_THRESHOLD       -15200
+
+typedef enum
+{
+    PUSHUP_STATE_TOP = 0,
+    PUSHUP_STATE_GOING_DOWN,
+    PUSHUP_STATE_BOTTOM,
+    PUSHUP_STATE_GOING_UP
+} PushupState;
+
+/* -------------------------------------------------------------------------- */
+/* MOVING AVERAGE FILTER                                                      */
+/* -------------------------------------------------------------------------- */
+typedef struct
+{
+    int buffer[FILTER_SIZE];
+    int index;
+    int sum;
+    uint8_t filled;
+} MovingAverageFilter;
+
+/* Global state --------------------------------------------------------------*/
+static ExerciseMode current_mode = EXERCISE_UNKNOWN;
+static ExerciseMode candidate_mode = EXERCISE_UNKNOWN;
+static uint32_t candidate_mode_start = 0;
+
+static SquatState squat_state = SQUAT_STATE_STANDING;
 static uint32_t squat_count = 0;
-static uint32_t last_rep_time = 0;
+static uint32_t squat_last_rep_time = 0;
+
+static PushupState pushup_state = PUSHUP_STATE_TOP;
+static uint32_t pushup_count = 0;
+static uint32_t pushup_last_rep_time = 0;
+
+static MovingAverageFilter squat_filter = {0};
+static MovingAverageFilter pushup_filter = {0};
+
+static uint32_t last_oled_update = 0;
 
 /* Function prototypes -------------------------------------------------------*/
 HAL_StatusTypeDef MPU6050_Init(void);
 HAL_StatusTypeDef MPU6050_ReadAccelRaw(int16_t *ax, int16_t *ay, int16_t *az);
-int MovingAverage_Update(int new_value);
+
+int MovingAverage_Update(MovingAverageFilter *f, int new_value);
+void MovingAverage_Reset(MovingAverageFilter *f);
+
+ExerciseMode Detect_ExerciseMode(int16_t ax, int16_t ay, int16_t az);
+void Update_Mode_Lock(ExerciseMode detected_mode, uint32_t now_ms);
+
 void Squat_Update(int value, uint32_t now_ms);
-const char *SquatState_ToString(SquatState state);
+void Pushup_Update(int value, uint32_t now_ms);
 
-/* Moving average buffer -----------------------------------------------------*/
-static int filter_buffer[FILTER_SIZE] = {0};
-static int filter_index = 0;
-static int filter_sum = 0;
-static uint8_t filter_filled = 0;
+const char* ExerciseMode_ToString(ExerciseMode mode);
+const char* SquatState_ToString(SquatState state);
+const char* PushupState_ToString(PushupState state);
 
+/* -------------------------------------------------------------------------- */
+/* MPU INIT                                                                   */
+/* -------------------------------------------------------------------------- */
 HAL_StatusTypeDef MPU6050_Init(void)
 {
     uint8_t who_am_i = 0;
     uint8_t wake_data = 0;
     HAL_StatusTypeDef status;
 
-    printf("Starting MPU6050 squat counter...\r\n");
+    printf("Starting MPU6050 squat + push-up counter...\r\n");
 
     status = HAL_I2C_Mem_Read(&hi2c1,
                               MPU6050_ADDR,
@@ -124,6 +204,9 @@ HAL_StatusTypeDef MPU6050_Init(void)
     return HAL_OK;
 }
 
+/* -------------------------------------------------------------------------- */
+/* MPU READ                                                                   */
+/* -------------------------------------------------------------------------- */
 HAL_StatusTypeDef MPU6050_ReadAccelRaw(int16_t *ax, int16_t *ay, int16_t *az)
 {
     uint8_t accel_data[6];
@@ -149,104 +232,270 @@ HAL_StatusTypeDef MPU6050_ReadAccelRaw(int16_t *ax, int16_t *ay, int16_t *az)
     return HAL_OK;
 }
 
-int MovingAverage_Update(int new_value)
+/* -------------------------------------------------------------------------- */
+/* MOVING AVERAGE                                                             */
+/* -------------------------------------------------------------------------- */
+int MovingAverage_Update(MovingAverageFilter *f, int new_value)
 {
-    filter_sum -= filter_buffer[filter_index];
-    filter_buffer[filter_index] = new_value;
-    filter_sum += new_value;
+    f->sum -= f->buffer[f->index];
+    f->buffer[f->index] = new_value;
+    f->sum += new_value;
 
-    filter_index++;
-    if (filter_index >= FILTER_SIZE)
+    f->index++;
+    if (f->index >= FILTER_SIZE)
     {
-        filter_index = 0;
-        filter_filled = 1;
+        f->index = 0;
+        f->filled = 1;
     }
 
-    if (filter_filled)
+    if (f->filled)
     {
-        return filter_sum / FILTER_SIZE;
+        return f->sum / FILTER_SIZE;
     }
     else
     {
-        int count = filter_index;
-        if (count == 0)
-            count = 1;
-        return filter_sum / count;
+        int count = f->index;
+        if (count == 0) count = 1;
+        return f->sum / count;
     }
 }
 
+void MovingAverage_Reset(MovingAverageFilter *f)
+{
+    memset(f->buffer, 0, sizeof(f->buffer));
+    f->index = 0;
+    f->sum = 0;
+    f->filled = 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* MODE DETECTION                                                             */
+/* -------------------------------------------------------------------------- */
+ExerciseMode Detect_ExerciseMode(int16_t ax, int16_t ay, int16_t az)
+{
+    (void)ax; /* not used yet */
+
+    int abs_ay = abs(ay);
+    int abs_az = abs(az);
+
+    if ((abs_ay > MODE_GRAVITY_HIGH) && (abs_az < MODE_GRAVITY_LOW))
+    {
+        return EXERCISE_SQUAT;
+    }
+    else if ((abs_az > MODE_GRAVITY_HIGH) && (abs_ay < MODE_GRAVITY_LOW))
+    {
+        return EXERCISE_PUSHUP;
+    }
+    else
+    {
+        return EXERCISE_UNKNOWN;
+    }
+}
+
+void Update_Mode_Lock(ExerciseMode detected_mode, uint32_t now_ms)
+{
+    if (detected_mode != candidate_mode)
+    {
+        candidate_mode = detected_mode;
+        candidate_mode_start = now_ms;
+        return;
+    }
+
+    if ((now_ms - candidate_mode_start) >= MODE_LOCK_MS)
+    {
+        if (current_mode != candidate_mode)
+        {
+            current_mode = candidate_mode;
+
+            /* Reset filters and per-exercise state when switching modes */
+            MovingAverage_Reset(&squat_filter);
+            MovingAverage_Reset(&pushup_filter);
+
+            squat_state = SQUAT_STATE_STANDING;
+            pushup_state = PUSHUP_STATE_TOP;
+
+            printf("MODE -> %s\r\n", ExerciseMode_ToString(current_mode));
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* SQUAT LOGIC                                                                */
+/* -------------------------------------------------------------------------- */
 void Squat_Update(int value, uint32_t now_ms)
 {
     switch (squat_state)
     {
-    case STATE_STANDING:
-        if (value < DOWN_THRESHOLD)
-        {
-            squat_state = STATE_GOING_DOWN;
-            printf("STATE -> GOING_DOWN\r\n");
-        }
-        break;
-
-    case STATE_GOING_DOWN:
-        if (value < BOTTOM_THRESHOLD)
-        {
-            squat_state = STATE_BOTTOM;
-            printf("STATE -> BOTTOM\r\n");
-        }
-        else if (value > STAND_THRESHOLD)
-        {
-            /* Went back up before completing a squat */
-            squat_state = STATE_STANDING;
-            printf("STATE -> STANDING (reset)\r\n");
-        }
-        break;
-
-    case STATE_BOTTOM:
-        if (value > UP_THRESHOLD)
-        {
-            squat_state = STATE_GOING_UP;
-            printf("STATE -> GOING_UP\r\n");
-        }
-        break;
-
-    case STATE_GOING_UP:
-        if (value > STAND_THRESHOLD)
-        {
-            if ((now_ms - last_rep_time) > REP_LOCKOUT_MS)
+        case SQUAT_STATE_STANDING:
+            if (value < SQUAT_DOWN_THRESHOLD)
             {
-                squat_count++;
-                last_rep_time = now_ms;
-                printf("SQUAT COUNT = %lu\r\n", (unsigned long)squat_count);
+                squat_state = SQUAT_STATE_GOING_DOWN;
+                printf("SQUAT STATE -> GOING_DOWN\r\n");
             }
+            break;
 
-            squat_state = STATE_STANDING;
-            printf("STATE -> STANDING\r\n");
-        }
-        break;
+        case SQUAT_STATE_GOING_DOWN:
+            if (value < SQUAT_BOTTOM_THRESHOLD)
+            {
+                squat_state = SQUAT_STATE_BOTTOM;
+                printf("SQUAT STATE -> BOTTOM\r\n");
+            }
+            else if (value > SQUAT_STAND_THRESHOLD)
+            {
+                squat_state = SQUAT_STATE_STANDING;
+                printf("SQUAT STATE -> STANDING (reset)\r\n");
+            }
+            break;
 
-    default:
-        squat_state = STATE_STANDING;
-        break;
+        case SQUAT_STATE_BOTTOM:
+            if (value > SQUAT_UP_THRESHOLD)
+            {
+                squat_state = SQUAT_STATE_GOING_UP;
+                printf("SQUAT STATE -> GOING_UP\r\n");
+            }
+            break;
+
+        case SQUAT_STATE_GOING_UP:
+            if (value > SQUAT_STAND_THRESHOLD)
+            {
+                if ((now_ms - squat_last_rep_time) > SQUAT_REP_LOCKOUT_MS)
+                {
+                    squat_count++;
+                    squat_last_rep_time = now_ms;
+                    printf("SQUAT COUNT = %lu\r\n", (unsigned long)squat_count);
+                }
+
+                squat_state = SQUAT_STATE_STANDING;
+                printf("SQUAT STATE -> STANDING\r\n");
+            }
+            break;
+
+        default:
+            squat_state = SQUAT_STATE_STANDING;
+            break;
     }
 }
 
-const char *SquatState_ToString(SquatState state)
+/* -------------------------------------------------------------------------- */
+/* PUSH-UP LOGIC                                                              */
+/* -------------------------------------------------------------------------- */
+void Pushup_Update(int value, uint32_t now_ms)
+{
+    switch (pushup_state)
+    {
+        case PUSHUP_STATE_TOP:
+            /* Going down = value becomes LESS negative */
+            if (value > PUSHUP_DOWN_THRESHOLD)
+            {
+                pushup_state = PUSHUP_STATE_GOING_DOWN;
+                printf("PUSHUP STATE -> GOING_DOWN\r\n");
+            }
+            break;
+
+        case PUSHUP_STATE_GOING_DOWN:
+            if (value > PUSHUP_BOTTOM_THRESHOLD)
+            {
+                pushup_state = PUSHUP_STATE_BOTTOM;
+                printf("PUSHUP STATE -> BOTTOM\r\n");
+            }
+            else if (value < PUSHUP_TOP_THRESHOLD)
+            {
+                /* Went back to top too early */
+                pushup_state = PUSHUP_STATE_TOP;
+                printf("PUSHUP STATE -> TOP (reset)\r\n");
+            }
+            break;
+
+        case PUSHUP_STATE_BOTTOM:
+            /* Going up = value becomes MORE negative again */
+            if (value < PUSHUP_UP_THRESHOLD)
+            {
+                pushup_state = PUSHUP_STATE_GOING_UP;
+                printf("PUSHUP STATE -> GOING_UP\r\n");
+            }
+            break;
+
+        case PUSHUP_STATE_GOING_UP:
+            if (value < PUSHUP_TOP_THRESHOLD)
+            {
+                if ((now_ms - pushup_last_rep_time) > PUSHUP_REP_LOCKOUT_MS)
+                {
+                    pushup_count++;
+                    pushup_last_rep_time = now_ms;
+                    printf("PUSHUP COUNT = %lu\r\n", (unsigned long)pushup_count);
+                }
+
+                pushup_state = PUSHUP_STATE_TOP;
+                printf("PUSHUP STATE -> TOP\r\n");
+            }
+            break;
+
+        default:
+            pushup_state = PUSHUP_STATE_TOP;
+            break;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* STRING HELPERS                                                             */
+/* -------------------------------------------------------------------------- */
+const char* ExerciseMode_ToString(ExerciseMode mode)
+{
+    switch (mode)
+    {
+        case EXERCISE_SQUAT:   return "SQUAT";
+        case EXERCISE_PUSHUP:  return "PUSHUP";
+        default:               return "UNKNOWN";
+    }
+}
+
+const char* SquatState_ToString(SquatState state)
 {
     switch (state)
     {
-    case STATE_STANDING:
-        return "STANDING";
-    case STATE_GOING_DOWN:
-        return "GOING_DOWN";
-    case STATE_BOTTOM:
-        return "BOTTOM";
-    case STATE_GOING_UP:
-        return "GOING_UP";
-    default:
-        return "UNKNOWN";
+        case SQUAT_STATE_STANDING:   return "STANDING";
+        case SQUAT_STATE_GOING_DOWN: return "GOING_DOWN";
+        case SQUAT_STATE_BOTTOM:     return "BOTTOM";
+        case SQUAT_STATE_GOING_UP:   return "GOING_UP";
+        default:                     return "UNKNOWN";
     }
 }
 
+const char* PushupState_ToString(PushupState state)
+{
+    switch (state)
+    {
+        case PUSHUP_STATE_TOP:        return "TOP";
+        case PUSHUP_STATE_GOING_DOWN: return "GOING_DOWN";
+        case PUSHUP_STATE_BOTTOM:     return "BOTTOM";
+        case PUSHUP_STATE_GOING_UP:   return "GOING_UP";
+        default:                      return "UNKNOWN";
+    }
+}
+
+void OLED_UpdateScreen(void)
+{
+    char line[24];
+
+    OLED_Clear();
+
+    OLED_WriteLine(0, "Motion Tracker");
+
+    sprintf(line, "Mode: %s", ExerciseMode_ToString(current_mode));
+    OLED_WriteLine(2, line);
+
+    sprintf(line, "Squats: %lu", (unsigned long)squat_count);
+    OLED_WriteLine(4, line);
+
+    sprintf(line, "Pushups: %lu", (unsigned long)pushup_count);
+    OLED_WriteLine(5, line);
+
+    OLED_Display();
+}
+
+/* -------------------------------------------------------------------------- */
+/* MAIN                                                                       */
+/* -------------------------------------------------------------------------- */
 int main(void)
 {
     HAL_Init();
@@ -256,22 +505,9 @@ int main(void)
     MX_I2C1_Init();
     MX_USART2_UART_Init();
 
-    /* Initialize OLED SSD1306 Display */
-    OLED_Init(&hi2c1);
-    
-    /* Display welcome message on OLED */
-    OLED_Clear();
-    OLED_WriteLine(0, "Hello Guys!");
-    OLED_WriteLine(1, "Squat Counter");
-    OLED_WriteLine(3, "Initializing...");
-    OLED_Display();
-
     if (MPU6050_Init() != HAL_OK)
     {
         printf("MPU init failed. Stopping.\r\n");
-        OLED_Clear();
-        OLED_WriteLine(0, "MPU Init Failed!");
-        OLED_Display();
         while (1)
         {
             HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
@@ -279,8 +515,14 @@ int main(void)
         }
     }
 
-    printf("Starting squat detection loop...\r\n");
-    printf("Default axis = AZ\r\n");
+
+    OLED_Init(&hi2c1);
+    OLED_Clear();
+    OLED_WriteLine(0, "Starting...");
+    OLED_Display();
+
+    printf("Starting combined squat + push-up detection loop...\r\n");
+    printf("Chest-mounted IMU mode detection enabled.\r\n");
     printf("Tune thresholds after first real test.\r\n\r\n");
 
     while (1)
@@ -296,39 +538,110 @@ int main(void)
             int ay_g_x100 = (ay * 100) / 16384;
             int az_g_x100 = (az * 100) / 16384;
 
-            /* Pick one axis for squat detection.
-               Start with AZ. Change this later if needed. */
-            int raw_axis = ay;
-            int filtered_axis = MovingAverage_Update(raw_axis);
+            ExerciseMode detected_mode = Detect_ExerciseMode(ax, ay, az);
+            Update_Mode_Lock(detected_mode, HAL_GetTick());
 
-            Squat_Update(filtered_axis, HAL_GetTick());
+            if (current_mode == EXERCISE_SQUAT)
+            {
+                int raw_axis = ay;
+                int filtered_axis = MovingAverage_Update(&squat_filter, raw_axis);
 
-            printf("AX=%d AY=%d AZ=%d | ", ax, ay, az);
+                Squat_Update(filtered_axis, HAL_GetTick());
 
-            printf("AX=%s%d.%02d g ",
-                   (ax_g_x100 < 0 ? "-" : ""),
-                   abs(ax_g_x100) / 100,
-                   abs(ax_g_x100) % 100);
+                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
+                       ExerciseMode_ToString(current_mode), ax, ay, az);
 
-            printf("AY=%s%d.%02d g ",
-                   (ay_g_x100 < 0 ? "-" : ""),
-                   abs(ay_g_x100) / 100,
-                   abs(ay_g_x100) % 100);
+                printf("AX=%s%d.%02d g ",
+                       (ax_g_x100 < 0 ? "-" : ""),
+                       abs(ax_g_x100) / 100,
+                       abs(ax_g_x100) % 100);
 
-            printf("AZ=%s%d.%02d g | ",
-                   (az_g_x100 < 0 ? "-" : ""),
-                   abs(az_g_x100) / 100,
-                   abs(az_g_x100) % 100);
+                printf("AY=%s%d.%02d g ",
+                       (ay_g_x100 < 0 ? "-" : ""),
+                       abs(ay_g_x100) / 100,
+                       abs(ay_g_x100) % 100);
 
-            printf("RAW_AXIS=%d FILTERED=%d STATE=%s COUNT=%lu\r\n",
-                   raw_axis,
-                   filtered_axis,
-                   SquatState_ToString(squat_state),
-                   (unsigned long)squat_count);
+                printf("AZ=%s%d.%02d g | ",
+                       (az_g_x100 < 0 ? "-" : ""),
+                       abs(az_g_x100) / 100,
+                       abs(az_g_x100) % 100);
+
+                printf("RAW=%d FILTERED=%d SQUAT_STATE=%s SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
+                       raw_axis,
+                       filtered_axis,
+                       SquatState_ToString(squat_state),
+                       (unsigned long)squat_count,
+                       (unsigned long)pushup_count);
+            }
+            else if (current_mode == EXERCISE_PUSHUP)
+            {
+                int raw_axis = az;
+                int filtered_axis = MovingAverage_Update(&pushup_filter, raw_axis);
+
+                Pushup_Update(filtered_axis, HAL_GetTick());
+
+                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
+                       ExerciseMode_ToString(current_mode), ax, ay, az);
+
+                printf("AX=%s%d.%02d g ",
+                       (ax_g_x100 < 0 ? "-" : ""),
+                       abs(ax_g_x100) / 100,
+                       abs(ax_g_x100) % 100);
+
+                printf("AY=%s%d.%02d g ",
+                       (ay_g_x100 < 0 ? "-" : ""),
+                       abs(ay_g_x100) / 100,
+                       abs(ay_g_x100) % 100);
+
+                printf("AZ=%s%d.%02d g | ",
+                       (az_g_x100 < 0 ? "-" : ""),
+                       abs(az_g_x100) / 100,
+                       abs(az_g_x100) % 100);
+
+                printf("RAW=%d FILTERED=%d PUSHUP_STATE=%s SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
+                       raw_axis,
+                       filtered_axis,
+                       PushupState_ToString(pushup_state),
+                       (unsigned long)squat_count,
+                       (unsigned long)pushup_count);
+            }
+            else
+            {
+                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
+                       ExerciseMode_ToString(current_mode), ax, ay, az);
+
+                printf("AX=%s%d.%02d g ",
+                       (ax_g_x100 < 0 ? "-" : ""),
+                       abs(ax_g_x100) / 100,
+                       abs(ax_g_x100) % 100);
+
+                printf("AY=%s%d.%02d g ",
+                       (ay_g_x100 < 0 ? "-" : ""),
+                       abs(ay_g_x100) / 100,
+                       abs(ay_g_x100) % 100);
+
+                printf("AZ=%s%d.%02d g | ",
+                       (az_g_x100 < 0 ? "-" : ""),
+                       abs(az_g_x100) / 100,
+                       abs(az_g_x100) % 100);
+
+                printf("SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
+                       (unsigned long)squat_count,
+                       (unsigned long)pushup_count);
+            }
         }
         else
         {
             printf("Accel read failed\r\n");
+        }
+
+        if (status == HAL_OK)
+        {
+        	if (HAL_GetTick() - last_oled_update >= 300)
+        	{
+        	    OLED_UpdateScreen();
+        	    last_oled_update = HAL_GetTick();
+        	}
         }
 
         HAL_Delay(SAMPLE_DELAY_MS);
@@ -336,9 +649,9 @@ int main(void)
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -356,7 +669,8 @@ void SystemClock_Config(void)
         Error_Handler();
     }
 
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
     RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
     RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
@@ -369,10 +683,10 @@ void SystemClock_Config(void)
 }
 
 /**
- * @brief I2C1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
     hi2c1.Instance = I2C1;
@@ -392,10 +706,10 @@ static void MX_I2C1_Init(void)
 }
 
 /**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART2_UART_Init(void)
 {
     huart2.Instance = USART2;
@@ -414,10 +728,10 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -435,9 +749,9 @@ static void MX_GPIO_Init(void)
 }
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
     __disable_irq();
