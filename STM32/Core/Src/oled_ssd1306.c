@@ -166,7 +166,6 @@ void OLED_Init(I2C_HandleTypeDef *hi2c)
 void OLED_Clear(void)
 {
     memset(oled.buffer, 0, SSD1306_BUFFER_SIZE);
-    OLED_Display();
 }
 
 /* Display buffer on OLED */
