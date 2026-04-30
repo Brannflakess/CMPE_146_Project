@@ -12,3 +12,13 @@ STM32/Release/
 *.hex
 *.map
 *.list
+
+# Node/JavaScript
+node_modules/
+*.log
+
+# Environment variables
+.env
+.env.local
+*.key
+serviceAccountKey.json
