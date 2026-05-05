@@ -600,6 +600,9 @@ int main(void)
     MX_I2C1_Init();
     MX_USART2_UART_Init();
 
+    /* Quick debug: test UART output */
+    printf("Hello STM32 UART - Debug Test\r\n");
+
     /* USER CODE BEGIN 2 */
     if (MPU6050_Init() != HAL_OK)
     {
@@ -634,6 +637,9 @@ int main(void)
 
         if (status == HAL_OK)
         {
+            int raw_axis = 0;
+            int filtered_axis = 0;
+            const char *state_string = "UNKNOWN";
             int ax_g_x100 = (ax * 100) / 16384;
             int ay_g_x100 = (ay * 100) / 16384;
             int az_g_x100 = (az * 100) / 16384;
@@ -643,92 +649,40 @@ int main(void)
 
             if (current_mode == EXERCISE_SQUAT)
             {
-                int raw_axis = ay;
-                int filtered_axis = MovingAverage_Update(&squat_filter, raw_axis);
+                raw_axis = ay;
+                filtered_axis = MovingAverage_Update(&squat_filter, raw_axis);
+                state_string = SquatState_ToString(squat_state);
 
                 Squat_Update(filtered_axis, HAL_GetTick());
 
-                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
-                       ExerciseMode_ToString(current_mode), ax, ay, az);
-
-                printf("AX=%s%d.%02d g ",
-                       (ax_g_x100 < 0 ? "-" : ""),
-                       abs(ax_g_x100) / 100,
-                       abs(ax_g_x100) % 100);
-
-                printf("AY=%s%d.%02d g ",
-                       (ay_g_x100 < 0 ? "-" : ""),
-                       abs(ay_g_x100) / 100,
-                       abs(ay_g_x100) % 100);
-
-                printf("AZ=%s%d.%02d g | ",
-                       (az_g_x100 < 0 ? "-" : ""),
-                       abs(az_g_x100) / 100,
-                       abs(az_g_x100) % 100);
-
-                printf("RAW=%d FILTERED=%d SQUAT_STATE=%s SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
-                       raw_axis,
-                       filtered_axis,
-                       SquatState_ToString(squat_state),
-                       (unsigned long)squat_count,
-                       (unsigned long)pushup_count);
             }
             else if (current_mode == EXERCISE_PUSHUP)
             {
-                int raw_axis = az;
-                int filtered_axis = MovingAverage_Update(&pushup_filter, raw_axis);
+                raw_axis = az;
+                filtered_axis = MovingAverage_Update(&pushup_filter, raw_axis);
+                state_string = PushupState_ToString(pushup_state);
 
                 Pushup_Update(filtered_axis, HAL_GetTick());
 
-                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
-                       ExerciseMode_ToString(current_mode), ax, ay, az);
-
-                printf("AX=%s%d.%02d g ",
-                       (ax_g_x100 < 0 ? "-" : ""),
-                       abs(ax_g_x100) / 100,
-                       abs(ax_g_x100) % 100);
-
-                printf("AY=%s%d.%02d g ",
-                       (ay_g_x100 < 0 ? "-" : ""),
-                       abs(ay_g_x100) / 100,
-                       abs(ay_g_x100) % 100);
-
-                printf("AZ=%s%d.%02d g | ",
-                       (az_g_x100 < 0 ? "-" : ""),
-                       abs(az_g_x100) / 100,
-                       abs(az_g_x100) % 100);
-
-                printf("RAW=%d FILTERED=%d PUSHUP_STATE=%s SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
-                       raw_axis,
-                       filtered_axis,
-                       PushupState_ToString(pushup_state),
-                       (unsigned long)squat_count,
-                       (unsigned long)pushup_count);
             }
             else
             {
-                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
-                       ExerciseMode_ToString(current_mode), ax, ay, az);
-
-                printf("AX=%s%d.%02d g ",
-                       (ax_g_x100 < 0 ? "-" : ""),
-                       abs(ax_g_x100) / 100,
-                       abs(ax_g_x100) % 100);
-
-                printf("AY=%s%d.%02d g ",
-                       (ay_g_x100 < 0 ? "-" : ""),
-                       abs(ay_g_x100) / 100,
-                       abs(ay_g_x100) % 100);
-
-                printf("AZ=%s%d.%02d g | ",
-                       (az_g_x100 < 0 ? "-" : ""),
-                       abs(az_g_x100) / 100,
-                       abs(az_g_x100) % 100);
-
-                printf("SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
-                       (unsigned long)squat_count,
-                       (unsigned long)pushup_count);
             }
+            char json[256];
+            sprintf(json, "{\"mode\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"state\":\"%s\",\"squat_count\":%lu,\"pushup_count\":%lu}\n",
+                    ExerciseMode_ToString(current_mode), ax, ay, az, raw_axis, filtered_axis, state_string, (unsigned long)squat_count, (unsigned long)pushup_count);
+            printf("%s", json);
+
+            printf("Mode=%s, AX=%d.%02d g, AY=%d.%02d g, AZ=%d.%02d g, Raw=%d, Filtered=%d, State=%s, Squat=%lu, Pushup=%lu\r\n",
+                   ExerciseMode_ToString(current_mode),
+                   ax_g_x100 / 100, abs(ax_g_x100 % 100),
+                   ay_g_x100 / 100, abs(ay_g_x100 % 100),
+                   az_g_x100 / 100, abs(az_g_x100 % 100),
+                   raw_axis,
+                   filtered_axis,
+                   state_string,
+                   (unsigned long)squat_count,
+                   (unsigned long)pushup_count);
         }
         else
         {
