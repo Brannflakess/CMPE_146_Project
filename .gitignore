@@ -22,3 +22,11 @@ node_modules/
 .env.local
 *.key
 serviceAccountKey.json
+
+# Secrets
+config_local.h
+config_local.h.example.actual
+
+# ESP32 PlatformIO
+ESP32/.pio/build/
+ESP32/.pio/libdeps/

@@ -1,0 +1,13 @@
+#pragma once
+#include <Arduino.h>
+
+// Copy this file to config_local.h and fill in your actual credentials
+// config_local.h is git-ignored and should NOT be committed
+
+// WiFi Credentials
+static constexpr const char *WIFI_SSID = "YourSSID";
+static constexpr const char *WIFI_PASS = "YourPassword";
+
+// Firebase / Firestore (optional, for future cloud features)
+// static constexpr const char *FIREBASE_PROJECT_ID = "your-firebase-project";
+// static constexpr const char *DEVICE_ID = "esp32-device-001";
