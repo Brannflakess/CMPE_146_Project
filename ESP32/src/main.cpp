@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include "config.h"
 #include "logger.h"
 #include "uart_receiver.h"
@@ -7,7 +8,44 @@
 
 static UartReceiver uart;
 static WifiManager wifi;
-static uint32_t lastSendMs = 0;
+
+static bool sendTelemetryToCloud(const TelemetryPacket &pkt)
+{
+    if (DATABASE_UPLOAD_URL[0] == '\0')
+    {
+        Logger::warn("DATABASE_UPLOAD_URL is empty - skipping cloud upload");
+        return false;
+    }
+
+    HTTPClient http;
+    http.begin(DATABASE_UPLOAD_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    if (DATABASE_API_KEY[0] != '\0')
+    {
+        http.addHeader("X-API-Key", DATABASE_API_KEY);
+    }
+
+    // Use PUT instead of POST to UPDATE/OVERWRITE the file
+    int statusCode = http.sendRequest("PUT", pkt.raw_json);
+    if (statusCode <= 0)
+    {
+        Serial.printf("[CLOUD] PUT failed: %s\n", http.errorToString(statusCode).c_str());
+        http.end();
+        return false;
+    }
+
+    String response = http.getString();
+    Serial.printf("[CLOUD] Updated telemetry, HTTP %d\n", statusCode);
+    if (response.length() > 0)
+    {
+        Serial.print("[CLOUD] Response: ");
+        Serial.println(response);
+    }
+
+    http.end();
+    return statusCode >= 200 && statusCode < 300;
+}
 
 void setup()
 {
@@ -40,21 +78,20 @@ void loop()
         // Display received telemetry
         Telemetry::print(pkt);
 
-        // Optionally send to cloud (future feature)
-        uint32_t now = millis();
-        if (now - lastSendMs >= SEND_INTERVAL_MS)
+        if (pkt.hasError)
         {
-            lastSendMs = now;
-
-            if (wifi.connected())
+            Logger::warn("Skipping cloud upload because packet parse failed");
+        }
+        else if (wifi.connected())
+        {
+            if (!sendTelemetryToCloud(pkt))
             {
-                Logger::info("WiFi connected - ready to send to cloud");
-                // TODO: sendTelemetryToCloud(pkt);
+                Logger::warn("Cloud upload failed");
             }
-            else
-            {
-                Logger::warn("WiFi offline - buffering telemetry locally");
-            }
+        }
+        else
+        {
+            Logger::warn("WiFi offline - telemetry not uploaded");
         }
     }
 

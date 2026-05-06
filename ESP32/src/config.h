@@ -18,9 +18,15 @@ static constexpr int UART_TX_PIN = 17; // Connect STM32 RX here
 // Send interval (ms)
 static constexpr uint32_t SEND_INTERVAL_MS = 1000;
 
+// Firebase Realtime Database REST endpoint
+// Format: https://<project>.firebaseio.com/<path>.json
+// PUT will UPDATE/OVERWRITE the file instead of creating new entries
+static constexpr const char *DATABASE_UPLOAD_URL = "https://mbet146project-default-rtdb.firebaseio.com/telemetry/current.json";
+static constexpr const char *DATABASE_API_KEY = "";
+
 // WiFi
-static constexpr const char *WIFI_SSID = "RaghaviPhone";
-static constexpr const char *WIFI_PASS = "12345678";
+static constexpr const char *WIFI_SSID = "YourSSID";
+static constexpr const char *WIFI_PASS = "YourPassword";
 
 // Local credentials (git-ignored)
 // Copy config_local.h.example to config_local.h and fill in your actual credentials

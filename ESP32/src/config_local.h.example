@@ -9,5 +9,10 @@ static constexpr const char *WIFI_SSID = "YourSSID";
 static constexpr const char *WIFI_PASS = "YourPassword";
 
 // Firebase / Firestore (optional, for future cloud features)
-// static constexpr const char *FIREBASE_PROJECT_ID = "your-firebase-project";
+// static constexpr const char *FIREBASE_PROJECT_ID = "mbet146project";
 // static constexpr const char *DEVICE_ID = "esp32-device-001";
+
+// REST endpoint that writes telemetry into your database.
+// Keep the Firebase service account key on this backend, not on the ESP32.
+// static constexpr const char *DATABASE_UPLOAD_URL = "https://your-api.example.com/telemetry";
+// static constexpr const char *DATABASE_API_KEY = "your-api-key-if-needed";

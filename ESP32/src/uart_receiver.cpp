@@ -50,7 +50,6 @@ void UartReceiver::parseJsonLine(const char *json, TelemetryPacket &out)
         out.hasError = true;
         out.errorMsg = "Unexpected src field";
     }
-
 }
 
 bool UartReceiver::tryReadPacket(TelemetryPacket &out)
