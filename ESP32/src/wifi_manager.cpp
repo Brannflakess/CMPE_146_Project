@@ -46,28 +46,21 @@ void WifiManager::loop()
 
         WiFi.mode(WIFI_STA);
         WiFi.begin(ssid, pass);
+    }
 
-        // Wait for connection with timeout
-        uint32_t startMs = millis();
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS)
-        {
-            delay(500);
-            attempts++;
-            Serial.print(".");
-            if (attempts % 10 == 0)
-                Serial.println();
-        }
-
+    // Check periodically for successful connection (non-blocking)
+    if (!isConnected && (now - lastCheckMs >= 1000))
+    {
+        lastCheckMs = now;
         if (WiFi.status() == WL_CONNECTED)
         {
             isConnected = true;
-            Serial.print("\n[WIFI] Connected! IP: ");
+            Serial.print("[WIFI] Connected! IP: ");
             Serial.println(WiFi.localIP());
         }
         else
         {
-            Logger::warn("WiFi connection timeout, will retry...");
+            Serial.print(".");
         }
     }
 }

@@ -12,14 +12,14 @@ static uint32_t lastSendMs = 0;
 void setup()
 {
     Logger::begin(PC_BAUD);
-    delay(500);
 
+    Serial.println("\n\n");
     Logger::info("========================================");
     Logger::info("CMPE_146 ESP32 Starting...");
     Logger::info("========================================");
 
     uart.begin(UART_BAUD, UART_RX_PIN, UART_TX_PIN);
-    Serial.printf("[UART] Initialized on RX=%d TX=%d @ %lu baud\n",
+    Serial.printf("\n[UART] Initialized on RX=%d TX=%d @ %lu baud\n",
                   UART_RX_PIN, UART_TX_PIN, (unsigned long)UART_BAUD);
 
     wifi.begin(WIFI_SSID, WIFI_PASS);

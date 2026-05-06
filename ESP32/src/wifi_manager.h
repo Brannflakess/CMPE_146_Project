@@ -14,5 +14,6 @@ private:
     const char *ssid = nullptr;
     const char *pass = nullptr;
     uint32_t lastTryMs = 0;
+    uint32_t lastCheckMs = 0;
     bool isConnected = false;
 };

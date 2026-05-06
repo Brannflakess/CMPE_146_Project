@@ -4,7 +4,7 @@
 void Logger::begin(uint32_t baud)
 {
     Serial.begin(baud);
-    delay(200);
+    delay(2000); // Wait for USB serial to be ready on ESP32
 }
 
 void Logger::info(const char *msg)
