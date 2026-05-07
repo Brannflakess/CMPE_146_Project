@@ -21,6 +21,15 @@
   font-size: 0.95rem;
 }
 
+.inline-code,
+.app-sub code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.88em;
+  background: #f1f5f9;
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+}
+
 .panel {
   background: #fff;
   border: 1px solid #e2e6ea;
@@ -59,6 +68,72 @@
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 0.75rem;
   margin-bottom: 1rem;
+}
+
+.stats-session {
+  margin-bottom: 0.65rem;
+}
+
+.panel-session-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.panel-session-head .panel-title {
+  margin: 0;
+}
+
+.live-pill {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #047857;
+  background: #d1fae5;
+  border: 1px solid #6ee7b7;
+  padding: 0.25rem 0.5rem;
+  border-radius: 999px;
+}
+
+.stat-card-wide {
+  grid-column: 1 / -1;
+}
+
+@media (min-width: 520px) {
+  .stat-card-wide {
+    grid-column: span 2;
+  }
+}
+
+.stat-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  word-break: break-all;
+}
+
+.stat-hint {
+  font-size: 0.7rem;
+  color: #64748b;
+}
+
+.stat-hint code {
+  font-size: inherit;
+}
+
+.telemetry-foot {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.telemetry-foot code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78em;
+  background: #f1f5f9;
+  padding: 0.06em 0.28em;
+  border-radius: 3px;
 }
 
 .stat-card {
@@ -123,6 +198,27 @@
 @media (prefers-color-scheme: dark) {
   .app-sub {
     color: #94a3b8;
+  }
+
+  .inline-code,
+  .app-sub code {
+    background: #334155;
+    color: #e2e8f0;
+  }
+
+  .live-pill {
+    color: #6ee7b7;
+    background: #064e3b;
+    border-color: #047857;
+  }
+
+  .stat-hint {
+    color: #94a3b8;
+  }
+
+  .telemetry-foot code {
+    background: #334155;
+    color: #e2e8f0;
   }
   .panel {
     background: #1e293b;
