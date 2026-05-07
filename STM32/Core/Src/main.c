@@ -18,6 +18,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -31,6 +32,7 @@ UART_HandleTypeDef huart2;
 #define FILTER_SIZE 5
 #define SAMPLE_DELAY_MS 80
 #define MODE_LOCK_MS 600
+#define ESP32_TX_PERIOD_MS 100
 
 /* -------------------------------------------------------------------------- */
 /* EXERCISE MODE DETECTION                                                    */
@@ -129,6 +131,7 @@ static MovingAverageFilter squat_filter = {0};
 static MovingAverageFilter pushup_filter = {0};
 
 static uint32_t last_oled_update = 0;
+static uint32_t last_esp32_tx = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -136,6 +139,7 @@ void SystemClock_Config(void);
 void OLED_UpdateScreen(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
@@ -154,6 +158,14 @@ void Pushup_Update(int value, uint32_t now_ms);
 const char *ExerciseMode_ToString(ExerciseMode mode);
 const char *SquatState_ToString(SquatState state);
 const char *PushupState_ToString(PushupState state);
+HAL_StatusTypeDef UART1_SendString(const char *msg);
+HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
+                                      int16_t ay,
+                                      int16_t az,
+                                      int raw_axis,
+                                      int filtered_axis,
+                                      const char *state_string,
+                                      uint32_t now_ms);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
@@ -162,6 +174,50 @@ int __io_putchar(int ch)
 {
     HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
     return ch;
+}
+
+HAL_StatusTypeDef UART1_SendString(const char *msg)
+{
+    size_t len = strlen(msg);
+    if (len == 0U)
+    {
+        return HAL_OK;
+    }
+    return HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)len, 100);
+}
+
+HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
+                                      int16_t ay,
+                                      int16_t az,
+                                      int raw_axis,
+                                      int filtered_axis,
+                                      const char *state_string,
+                                      uint32_t now_ms)
+{
+    char packet[256];
+    int written = snprintf(packet,
+                           sizeof(packet),
+                           "{\"src\":\"stm32\",\"t_ms\":%lu,\"mode\":\"%s\",\"state\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"squat_count\":%lu,\"pushup_count\":%lu,\"oled_mode\":\"%s\",\"oled_squats\":%lu,\"oled_pushups\":%lu}\r\n",
+                           (unsigned long)now_ms,
+                           ExerciseMode_ToString(current_mode),
+                           state_string,
+                           ax,
+                           ay,
+                           az,
+                           raw_axis,
+                           filtered_axis,
+                           (unsigned long)squat_count,
+                           (unsigned long)pushup_count,
+                           ExerciseMode_ToString(current_mode),
+                           (unsigned long)squat_count,
+                           (unsigned long)pushup_count);
+
+    if ((written <= 0) || (written >= (int)sizeof(packet)))
+    {
+        return HAL_ERROR;
+    }
+
+    return UART1_SendString(packet);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -598,7 +654,11 @@ int main(void)
 
     MX_GPIO_Init();
     MX_I2C1_Init();
+    MX_USART1_UART_Init();
     MX_USART2_UART_Init();
+
+    /* Quick debug: test UART output */
+    printf("Hello STM32 UART - Debug Test\r\n");
 
     /* USER CODE BEGIN 2 */
     if (MPU6050_Init() != HAL_OK)
@@ -634,100 +694,58 @@ int main(void)
 
         if (status == HAL_OK)
         {
+            int raw_axis = 0;
+            int filtered_axis = 0;
+            const char *state_string = "UNKNOWN";
+            uint32_t now_ms = HAL_GetTick();
             int ax_g_x100 = (ax * 100) / 16384;
             int ay_g_x100 = (ay * 100) / 16384;
             int az_g_x100 = (az * 100) / 16384;
 
             ExerciseMode detected_mode = Detect_ExerciseMode(ax, ay, az);
-            Update_Mode_Lock(detected_mode, HAL_GetTick());
+            Update_Mode_Lock(detected_mode, now_ms);
 
             if (current_mode == EXERCISE_SQUAT)
             {
-                int raw_axis = ay;
-                int filtered_axis = MovingAverage_Update(&squat_filter, raw_axis);
+                raw_axis = ay;
+                filtered_axis = MovingAverage_Update(&squat_filter, raw_axis);
+                state_string = SquatState_ToString(squat_state);
 
-                Squat_Update(filtered_axis, HAL_GetTick());
-
-                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
-                       ExerciseMode_ToString(current_mode), ax, ay, az);
-
-                printf("AX=%s%d.%02d g ",
-                       (ax_g_x100 < 0 ? "-" : ""),
-                       abs(ax_g_x100) / 100,
-                       abs(ax_g_x100) % 100);
-
-                printf("AY=%s%d.%02d g ",
-                       (ay_g_x100 < 0 ? "-" : ""),
-                       abs(ay_g_x100) / 100,
-                       abs(ay_g_x100) % 100);
-
-                printf("AZ=%s%d.%02d g | ",
-                       (az_g_x100 < 0 ? "-" : ""),
-                       abs(az_g_x100) / 100,
-                       abs(az_g_x100) % 100);
-
-                printf("RAW=%d FILTERED=%d SQUAT_STATE=%s SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
-                       raw_axis,
-                       filtered_axis,
-                       SquatState_ToString(squat_state),
-                       (unsigned long)squat_count,
-                       (unsigned long)pushup_count);
+                Squat_Update(filtered_axis, now_ms);
             }
             else if (current_mode == EXERCISE_PUSHUP)
             {
-                int raw_axis = az;
-                int filtered_axis = MovingAverage_Update(&pushup_filter, raw_axis);
+                raw_axis = az;
+                filtered_axis = MovingAverage_Update(&pushup_filter, raw_axis);
+                state_string = PushupState_ToString(pushup_state);
 
-                Pushup_Update(filtered_axis, HAL_GetTick());
-
-                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
-                       ExerciseMode_ToString(current_mode), ax, ay, az);
-
-                printf("AX=%s%d.%02d g ",
-                       (ax_g_x100 < 0 ? "-" : ""),
-                       abs(ax_g_x100) / 100,
-                       abs(ax_g_x100) % 100);
-
-                printf("AY=%s%d.%02d g ",
-                       (ay_g_x100 < 0 ? "-" : ""),
-                       abs(ay_g_x100) / 100,
-                       abs(ay_g_x100) % 100);
-
-                printf("AZ=%s%d.%02d g | ",
-                       (az_g_x100 < 0 ? "-" : ""),
-                       abs(az_g_x100) / 100,
-                       abs(az_g_x100) % 100);
-
-                printf("RAW=%d FILTERED=%d PUSHUP_STATE=%s SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
-                       raw_axis,
-                       filtered_axis,
-                       PushupState_ToString(pushup_state),
-                       (unsigned long)squat_count,
-                       (unsigned long)pushup_count);
+                Pushup_Update(filtered_axis, now_ms);
             }
             else
             {
-                printf("[MODE=%s] AX=%d AY=%d AZ=%d | ",
-                       ExerciseMode_ToString(current_mode), ax, ay, az);
+            }
+            char json[256];
+            sprintf(json, "{\"mode\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"state\":\"%s\",\"squat_count\":%lu,\"pushup_count\":%lu}\n",
+                    ExerciseMode_ToString(current_mode), ax, ay, az, raw_axis, filtered_axis, state_string, (unsigned long)squat_count, (unsigned long)pushup_count);
+            printf("%s", json);
 
-                printf("AX=%s%d.%02d g ",
-                       (ax_g_x100 < 0 ? "-" : ""),
-                       abs(ax_g_x100) / 100,
-                       abs(ax_g_x100) % 100);
+            printf("Mode=%s, AX=%d.%02d g, AY=%d.%02d g, AZ=%d.%02d g, Raw=%d, Filtered=%d, State=%s, Squat=%lu, Pushup=%lu\r\n",
+                   ExerciseMode_ToString(current_mode),
+                   ax_g_x100 / 100, abs(ax_g_x100 % 100),
+                   ay_g_x100 / 100, abs(ay_g_x100 % 100),
+                   az_g_x100 / 100, abs(az_g_x100 % 100),
+                   raw_axis,
+                   filtered_axis,
+                   state_string,
+                   (unsigned long)squat_count,
+                   (unsigned long)pushup_count);
 
-                printf("AY=%s%d.%02d g ",
-                       (ay_g_x100 < 0 ? "-" : ""),
-                       abs(ay_g_x100) / 100,
-                       abs(ay_g_x100) % 100);
-
-                printf("AZ=%s%d.%02d g | ",
-                       (az_g_x100 < 0 ? "-" : ""),
-                       abs(az_g_x100) / 100,
-                       abs(az_g_x100) % 100);
-
-                printf("SQUAT_COUNT=%lu PUSHUP_COUNT=%lu\r\n",
-                       (unsigned long)squat_count,
-                       (unsigned long)pushup_count);
+            if ((now_ms - last_esp32_tx) >= ESP32_TX_PERIOD_MS)
+            {
+                if (ESP32_SendTelemetry(ax, ay, az, raw_axis, filtered_axis, state_string, now_ms) == HAL_OK)
+                {
+                    last_esp32_tx = now_ms;
+                }
             }
         }
         else
@@ -800,6 +818,28 @@ static void MX_I2C1_Init(void)
     hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
 
     if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/**
+ * @brief USART1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart1) != HAL_OK)
     {
         Error_Handler();
     }
