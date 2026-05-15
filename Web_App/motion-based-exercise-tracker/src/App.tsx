@@ -125,7 +125,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1 className="app-title">Motion exercise tracker</h1>
+        <h1 className="app-title">Motion Based Exercise Tracker</h1>
       </header>
 
       {!configured && (

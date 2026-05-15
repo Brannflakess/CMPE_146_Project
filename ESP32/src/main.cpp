@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include "config.h"
@@ -12,43 +11,56 @@ static UartReceiver uart;
 static WifiManager wifi;
 static Preferences s_prefs;
 
-/** Last good UART line per session — updated even when WiFi is down so unplug/replug archives final counts. */
-static uint32_t g_uart_last_session_id = 0;
+/** Last good UART packet — used for idle/session-change archive (not raw JSON string). */
+static TelemetryPacket g_uart_last_pkt;
+static uint32_t g_uart_last_stm32_session_id = 0;
 static bool g_uart_have_last_session = false;
-static String g_uart_last_raw_json;
 
-/** Monotonic id stored in NVS — written to Firebase as `session_id` (STM32 value may repeat across power cycles). */
 static uint32_t g_cloud_session_id = 0;
 
-/** No UART for this long ⇒ archive last session (covers repeat STM32 session_id after power cycle). */
 static constexpr uint32_t UART_IDLE_ARCHIVE_MS = 4000;
 static uint32_t g_last_uart_rx_ms = 0;
 static bool g_uart_idle_archive_done = false;
-
-/** After idle archive, skip one STM32 session-id-change archive to avoid double-write. */
 static bool g_skip_session_change_archive_once = false;
+
+/** Per cloud session — rep counts must not decrease (guards against partial UART JSON). */
+static uint32_t g_cloud_max_squats = 0;
+static uint32_t g_cloud_max_pushups = 0;
+
+static void resetCloudSessionRepMax(void)
+{
+    g_cloud_max_squats = 0;
+    g_cloud_max_pushups = 0;
+}
+
+static void applyMonotonicRepCounts(TelemetryPacket &pkt)
+{
+    if (pkt.squat_count > g_cloud_max_squats)
+    {
+        g_cloud_max_squats = pkt.squat_count;
+    }
+    else
+    {
+        pkt.squat_count = g_cloud_max_squats;
+        pkt.oled_squats = g_cloud_max_squats;
+    }
+
+    if (pkt.pushup_count > g_cloud_max_pushups)
+    {
+        g_cloud_max_pushups = pkt.pushup_count;
+    }
+    else
+    {
+        pkt.pushup_count = g_cloud_max_pushups;
+        pkt.oled_pushups = g_cloud_max_pushups;
+    }
+}
 
 static uint32_t takeNextPersistentCloudSessionId(void)
 {
     uint32_t n = s_prefs.getULong("next", 1);
     (void)s_prefs.putULong("next", (unsigned long)n + 1U);
     return n;
-}
-
-/** Replace `session_id` in JSON for Firebase; keep STM32 value as `stm32_session_id` for debugging. */
-static String jsonWithCloudSessionId(const String &raw, uint32_t cloudSid)
-{
-    JsonDocument doc;
-    if (deserializeJson(doc, raw))
-    {
-        return raw;
-    }
-    uint32_t stm = doc["session_id"].as<uint32_t>();
-    doc["stm32_session_id"] = stm;
-    doc["session_id"] = cloudSid;
-    String out;
-    serializeJson(doc, out);
-    return out;
 }
 
 static bool httpPutJson(const char *url, const String &jsonBody)
@@ -87,47 +99,32 @@ static bool httpPutJson(const char *url, const String &jsonBody)
     return statusCode >= 200 && statusCode < 300;
 }
 
-static bool archiveSessionSnapshot(uint32_t cloudArchiveKey, const String &jsonBody)
+static bool archiveSessionSnapshot(uint32_t cloudArchiveKey, const TelemetryPacket &pkt)
 {
     if (cloudArchiveKey == 0U)
     {
         return true;
     }
 
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, jsonBody);
-    if (err)
-    {
-        Logger::warn("Archive: JSON parse failed; storing minimal record");
-        doc.clear();
-        doc["session_id"] = cloudArchiveKey;
-        doc["parse_error"] = err.c_str();
-        doc["raw_line"] = jsonBody;
-    }
-    else
-    {
-        doc["session_id"] = cloudArchiveKey;
-    }
-
-    doc["archived"] = true;
-    doc["archived_at_esp_ms"] = millis();
-
-    String body;
-    if (serializeJson(doc, body) == 0)
-    {
-        Logger::warn("Archive: serialize failed");
-        return false;
-    }
-
+    const String body = Telemetry::toCloudJson(pkt, cloudArchiveKey, true, millis());
     String url =
         String(DATABASE_ROOT_URL) + "/telemetry/archive/" + String((unsigned long)cloudArchiveKey) + ".json";
     return httpPutJson(url.c_str(), body);
 }
 
-static bool uploadCurrentTelemetryJson(const String &jsonBody)
+static bool uploadCurrentTelemetry(const TelemetryPacket &pkt, uint32_t cloudSessionId)
 {
+    const String body = Telemetry::toCloudJson(pkt, cloudSessionId, false, 0);
     String url = String(DATABASE_ROOT_URL) + "/telemetry/current.json";
-    return httpPutJson(url.c_str(), jsonBody);
+    return httpPutJson(url.c_str(), body);
+}
+
+static void rememberUartPacket(const TelemetryPacket &pkt)
+{
+    g_uart_last_pkt = pkt;
+    g_uart_last_pkt.raw_json = pkt.raw_json;
+    g_uart_last_stm32_session_id = pkt.session_id;
+    g_uart_have_last_session = (pkt.session_id != 0U);
 }
 
 void setup()
@@ -175,6 +172,7 @@ void loop()
             if (pkt.session_id != 0U && g_cloud_session_id == 0U)
             {
                 g_cloud_session_id = takeNextPersistentCloudSessionId();
+                resetCloudSessionRepMax();
                 Serial.printf("[CLOUD] Assigned cloud session_id=%lu\n", (unsigned long)g_cloud_session_id);
             }
 
@@ -182,21 +180,23 @@ void loop()
             {
                 g_skip_session_change_archive_once = false;
             }
-            else if (pkt.session_id != 0U && g_uart_have_last_session && pkt.session_id != g_uart_last_session_id)
+            else if (pkt.session_id != 0U && g_uart_have_last_session &&
+                     pkt.session_id != g_uart_last_stm32_session_id)
             {
                 if (wifi.connected())
                 {
-                    const String archiveBody = jsonWithCloudSessionId(g_uart_last_raw_json, g_cloud_session_id);
-                    if (!archiveSessionSnapshot(g_cloud_session_id, archiveBody))
+                    const uint32_t archiveKey = g_cloud_session_id;
+                    if (!archiveSessionSnapshot(archiveKey, g_uart_last_pkt))
                     {
                         Logger::warn("Archive of previous session failed; continuing with live PUT");
                     }
                     else
                     {
                         Serial.printf("[CLOUD] Archived cloud session %lu (STM32 session id changed)\n",
-                                      (unsigned long)g_cloud_session_id);
+                                      (unsigned long)archiveKey);
                     }
                     g_cloud_session_id = takeNextPersistentCloudSessionId();
+                    resetCloudSessionRepMax();
                     Serial.printf("[CLOUD] New cloud session_id=%lu\n", (unsigned long)g_cloud_session_id);
                 }
                 else
@@ -205,17 +205,12 @@ void loop()
                 }
             }
 
-            if (pkt.session_id != 0U)
-            {
-                g_uart_have_last_session = true;
-                g_uart_last_session_id = pkt.session_id;
-                g_uart_last_raw_json = pkt.raw_json;
-            }
+            applyMonotonicRepCounts(pkt);
+            rememberUartPacket(pkt);
 
             if (wifi.connected() && g_cloud_session_id != 0U)
             {
-                const String outJson = jsonWithCloudSessionId(pkt.raw_json, g_cloud_session_id);
-                if (!uploadCurrentTelemetryJson(outJson))
+                if (!uploadCurrentTelemetry(pkt, g_cloud_session_id))
                 {
                     Logger::warn("Cloud upload failed");
                 }
@@ -234,17 +229,18 @@ void loop()
     if (g_uart_have_last_session && (g_last_uart_rx_ms != 0U) && wifi.connected() && (g_cloud_session_id != 0U) &&
         !g_uart_idle_archive_done && ((millis() - g_last_uart_rx_ms) >= UART_IDLE_ARCHIVE_MS))
     {
-        const String archiveBody = jsonWithCloudSessionId(g_uart_last_raw_json, g_cloud_session_id);
-        if (!archiveSessionSnapshot(g_cloud_session_id, archiveBody))
+        const uint32_t archiveKey = g_cloud_session_id;
+        if (!archiveSessionSnapshot(archiveKey, g_uart_last_pkt))
         {
             Logger::warn("Idle archive failed (UART quiet)");
         }
         else
         {
             Serial.printf("[CLOUD] Idle-archived cloud session %lu (no UART for %lu ms)\n",
-                          (unsigned long)g_cloud_session_id, (unsigned long)UART_IDLE_ARCHIVE_MS);
+                          (unsigned long)archiveKey, (unsigned long)UART_IDLE_ARCHIVE_MS);
         }
         g_cloud_session_id = takeNextPersistentCloudSessionId();
+        resetCloudSessionRepMax();
         Serial.printf("[CLOUD] New cloud session_id=%lu (after idle)\n", (unsigned long)g_cloud_session_id);
         g_uart_idle_archive_done = true;
         g_skip_session_change_archive_once = true;

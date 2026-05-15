@@ -39,18 +39,33 @@ void UartReceiver::parseJsonLine(const char *json, TelemetryPacket &out)
     out.raw = doc["raw"] | 0;
     out.filtered = doc["filtered"] | 0;
 
-    out.squat_count = doc["squat_count"] | 0;
-    out.pushup_count = doc["pushup_count"] | 0;
-
-    out.oled_mode = String((const char *)(doc["oled_mode"] | out.mode.c_str()));
-    out.oled_squats = doc["oled_squats"] | out.squat_count;
-    out.oled_pushups = doc["oled_pushups"] | out.pushup_count;
-
     if (out.src != "stm32")
     {
         out.hasError = true;
         out.errorMsg = "Unexpected src field";
+        return;
     }
+
+    /* Reject short/debug JSON (no oled_* keys) — missing keys would read as 0 and flash counts in Firebase. */
+    if (!doc["oled_squats"].is<uint32_t>() && !doc["oled_squats"].is<int>() && !doc["oled_squats"].is<long>())
+    {
+        out.hasError = true;
+        out.errorMsg = "Not a full telemetry line (missing oled_squats)";
+        return;
+    }
+    if (!doc["squat_count"].is<uint32_t>() && !doc["squat_count"].is<int>() && !doc["squat_count"].is<long>())
+    {
+        out.hasError = true;
+        out.errorMsg = "Not a full telemetry line (missing squat_count)";
+        return;
+    }
+
+    out.squat_count = doc["squat_count"].as<uint32_t>();
+    out.pushup_count = doc["pushup_count"].as<uint32_t>();
+
+    out.oled_mode = String((const char *)(doc["oled_mode"] | out.mode.c_str()));
+    out.oled_squats = doc["oled_squats"].as<uint32_t>();
+    out.oled_pushups = doc["oled_pushups"].as<uint32_t>();
 }
 
 bool UartReceiver::tryReadPacket(TelemetryPacket &out)

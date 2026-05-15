@@ -239,7 +239,7 @@ HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
                                       const char *state_string,
                                       uint32_t now_ms)
 {
-    char packet[320];
+    char packet[512];
     int written = snprintf(packet,
                            sizeof(packet),
                            "{\"src\":\"stm32\",\"session_id\":%lu,\"t_ms\":%lu,\"mode\":\"%s\",\"state\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"squat_count\":%lu,\"pushup_count\":%lu,\"oled_mode\":\"%s\",\"oled_squats\":%lu,\"oled_pushups\":%lu}\r\n",
@@ -780,11 +780,6 @@ int main(void)
             else
             {
             }
-            char json[256];
-            sprintf(json, "{\"mode\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"state\":\"%s\",\"squat_count\":%lu,\"pushup_count\":%lu}\n",
-                    ExerciseMode_ToString(current_mode), ax, ay, az, raw_axis, filtered_axis, state_string, (unsigned long)squat_count, (unsigned long)pushup_count);
-            printf("%s", json);
-
             printf("Mode=%s, AX=%d.%02d g, AY=%d.%02d g, AZ=%d.%02d g, Raw=%d, Filtered=%d, State=%s, Squat=%lu, Pushup=%lu\r\n",
                    ExerciseMode_ToString(current_mode),
                    ax_g_x100 / 100, abs(ax_g_x100 % 100),

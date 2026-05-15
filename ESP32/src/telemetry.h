@@ -31,6 +31,10 @@ struct TelemetryPacket
 
 struct Telemetry
 {
+    /** Canonical Firebase JSON from parsed fields (avoids corrupt keys from truncated UART lines). */
+    static String toCloudJson(const TelemetryPacket &pkt, uint32_t cloudSessionId, bool archived = false,
+                              uint32_t archivedAtEspMs = 0);
+
     static void print(const TelemetryPacket &pkt)
     {
         if (pkt.hasError)
