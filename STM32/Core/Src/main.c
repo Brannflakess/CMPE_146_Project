@@ -38,18 +38,11 @@ UART_HandleTypeDef huart2;
 /* EXERCISE MODE DETECTION                                                    */
 /* -------------------------------------------------------------------------- */
 /*
- * Assumption for chest-mounted vertical board:
- *
- * - Standing upright for squats:
- *     |AY| tends to be large (near 1g), while |AZ| is smaller
- *
- * - Horizontal body position for push-ups:
- *     |AZ| tends to be large (near 1g), while |AY| is smaller
- *
- * These values are placeholders and should be tuned from real logs.
+ * Chest-mounted board: during real motion, |AY| and |AZ| are often BOTH large.
+ * Use *dominant axis* (larger |accel| wins by margin) once total tilt is strong enough.
  */
-#define MODE_GRAVITY_HIGH 13000
-#define MODE_GRAVITY_LOW 9000
+#define MODE_GRAVITY_HIGH 9500       /* min(|AY|,|AZ|) max — "enough tilt" to pick squat vs push-up */
+#define MODE_AXIS_DOMINANCE_MARGIN 800 /* dominant axis must exceed the other by this (raw units) */
 
 typedef enum
 {
@@ -61,17 +54,23 @@ typedef enum
 /* -------------------------------------------------------------------------- */
 /* SQUAT SETTINGS                                                             */
 /* -------------------------------------------------------------------------- */
-#define SQUAT_REP_LOCKOUT_MS 1200
+#define SQUAT_REP_LOCKOUT_MS 1000
 #define SQUAT_STAND_THRESHOLD 15000
 #define SQUAT_DOWN_THRESHOLD 13800
 #define SQUAT_BOTTOM_THRESHOLD 12800
 #define SQUAT_UP_THRESHOLD 13800
 
-/* Range/delta-based thresholds (values are in raw sensor units) */
-#define SQUAT_DOWN_DELTA 1400   /* drop from baseline to consider going down */
-#define SQUAT_BOTTOM_DELTA 2200 /* deeper drop to consider bottom */
-#define SQUAT_MIN_ROM 1200      /* minimum peak-to-peak chest travel to count rep */
+/* Range/delta-based thresholds (filtered AY). Lower = easier partial squats. */
+#define SQUAT_DOWN_DELTA 900       /* start descent with less drop from baseline */
+#define SQUAT_BOTTOM_DELTA 1500    /* register bottom with less depth */
+#define SQUAT_MIN_ROM 650          /* count smaller ROM reps */
 #define MIN_STATE_HOLD 2
+/* GOING_DOWN: abort only when nearly upright again (lower = fewer false aborts) */
+#define SQUAT_DOWN_ABORT_DELTA 280
+/* Leaving BOTTOM: fraction of BOTTOM_DELTA (higher = easier / shallower squat) */
+#define SQUAT_LEAVE_BOTTOM_MULT 0.72f
+/* GOING_UP -> STANDING: fraction of DOWN_DELTA (higher = finish rep before fully upright) */
+#define SQUAT_STANDING_DONE_MULT 0.82f
 
 typedef enum
 {
@@ -84,12 +83,20 @@ typedef enum
 /* -------------------------------------------------------------------------- */
 /* PUSH-UP SETTINGS                                                           */
 /* -------------------------------------------------------------------------- */
-#define PUSHUP_REP_LOCKOUT_MS 900
+#define PUSHUP_REP_LOCKOUT_MS 500
 
-#define PUSHUP_TOP_THRESHOLD -16500
-#define PUSHUP_DOWN_THRESHOLD -15500
-#define PUSHUP_BOTTOM_THRESHOLD -14200
-#define PUSHUP_UP_THRESHOLD -15200
+/*
+ * Filtered AZ (raw units). "Going down" = less negative; BOTTOM needs value > BOTTOM_THRESHOLD.
+ * If BOTTOM is too close to 0 (e.g. -9800) but your filtered trace only reaches ~-11k, BOTTOM never triggers.
+ *
+ * TOP_ABORT: while lowering — very negative = cancel rep.
+ * TOP_COMPLETE: while pressing up — shallow lock-out still counts.
+ */
+#define PUSHUP_TOP_ABORT_THRESHOLD -20600
+#define PUSHUP_TOP_COMPLETE_THRESHOLD -13600
+#define PUSHUP_DOWN_THRESHOLD -13200
+#define PUSHUP_BOTTOM_THRESHOLD -13600
+#define PUSHUP_UP_THRESHOLD -10200
 
 typedef enum
 {
@@ -132,6 +139,12 @@ static MovingAverageFilter pushup_filter = {0};
 
 static uint32_t last_oled_update = 0;
 static uint32_t last_esp32_tx = 0;
+
+/* Monotonic per boot: new value after reset or power cycle (used as Firebase session key). */
+static uint32_t g_session_id = 0;
+
+/* I2C: consecutive MPU read failures before bus/controller recovery */
+static uint8_t i2c_accel_fail_streak = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -166,6 +179,8 @@ HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
                                       int filtered_axis,
                                       const char *state_string,
                                       uint32_t now_ms);
+static void SessionId_InitAtBoot(void);
+static void RecoverI2C1_AfterBusError(void);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
@@ -186,6 +201,36 @@ HAL_StatusTypeDef UART1_SendString(const char *msg)
     return HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)len, 100);
 }
 
+static void RecoverI2C1_AfterBusError(void)
+{
+    (void)HAL_I2C_DeInit(&hi2c1);
+    HAL_Delay(5);
+    MX_I2C1_Init();
+    printf("I2C1 bus recovery (DeInit + MX_I2C1_Init)\r\n");
+}
+
+static void SessionId_InitAtBoot(void)
+{
+    /* DWT cycle counter + SysTick vary each reset/power-on; HAL_GetTick() is often ~0 here
+     * if called early — mixing avoids repeating the same session_id after unplug/replug. */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    uint32_t uid = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
+    uint32_t csr = RCC->CSR;
+    uint32_t cy = DWT->CYCCNT;
+    uint32_t tick = (uint32_t)HAL_GetTick();
+    uint32_t systick = SysTick->VAL;
+
+    g_session_id = uid ^ csr ^ cy ^ (tick * 0x9E3779B9u) ^ (systick << 17) ^ (systick >> 3);
+    if (g_session_id == 0U)
+    {
+        g_session_id = 1U;
+    }
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+}
+
 HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
                                       int16_t ay,
                                       int16_t az,
@@ -194,10 +239,11 @@ HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
                                       const char *state_string,
                                       uint32_t now_ms)
 {
-    char packet[256];
+    char packet[320];
     int written = snprintf(packet,
                            sizeof(packet),
-                           "{\"src\":\"stm32\",\"t_ms\":%lu,\"mode\":\"%s\",\"state\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"squat_count\":%lu,\"pushup_count\":%lu,\"oled_mode\":\"%s\",\"oled_squats\":%lu,\"oled_pushups\":%lu}\r\n",
+                           "{\"src\":\"stm32\",\"session_id\":%lu,\"t_ms\":%lu,\"mode\":\"%s\",\"state\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"squat_count\":%lu,\"pushup_count\":%lu,\"oled_mode\":\"%s\",\"oled_squats\":%lu,\"oled_pushups\":%lu}\r\n",
+                           (unsigned long)g_session_id,
                            (unsigned long)now_ms,
                            ExerciseMode_ToString(current_mode),
                            state_string,
@@ -343,23 +389,27 @@ void MovingAverage_Reset(MovingAverageFilter *f)
 /* -------------------------------------------------------------------------- */
 ExerciseMode Detect_ExerciseMode(int16_t ax, int16_t ay, int16_t az)
 {
-    (void)ax; /* not used yet */
+    (void)ax;
 
     int abs_ay = abs(ay);
     int abs_az = abs(az);
+    const int max_axis = (abs_ay > abs_az) ? abs_ay : abs_az;
 
-    if ((abs_ay > MODE_GRAVITY_HIGH) && (abs_az < MODE_GRAVITY_LOW))
-    {
-        return EXERCISE_SQUAT;
-    }
-    else if ((abs_az > MODE_GRAVITY_HIGH) && (abs_ay < MODE_GRAVITY_LOW))
-    {
-        return EXERCISE_PUSHUP;
-    }
-    else
+    if (max_axis <= MODE_GRAVITY_HIGH)
     {
         return EXERCISE_UNKNOWN;
     }
+
+    if (abs_ay > (abs_az + MODE_AXIS_DOMINANCE_MARGIN))
+    {
+        return EXERCISE_SQUAT;
+    }
+    if (abs_az > (abs_ay + MODE_AXIS_DOMINANCE_MARGIN))
+    {
+        return EXERCISE_PUSHUP;
+    }
+
+    return EXERCISE_UNKNOWN;
 }
 
 void Update_Mode_Lock(ExerciseMode detected_mode, uint32_t now_ms)
@@ -449,7 +499,7 @@ void Squat_Update(int value, uint32_t now_ms)
                 printf("SQUAT STATE -> BOTTOM (delta=%.0f)\r\n", delta);
             }
         }
-        else if (squat_baseline_init && (delta < (SQUAT_DOWN_DELTA / 2.0f)))
+        else if (squat_baseline_init && (delta < (float)SQUAT_DOWN_ABORT_DELTA))
         {
             /* aborted descent */
             squat_state = SQUAT_STATE_STANDING;
@@ -460,7 +510,7 @@ void Squat_Update(int value, uint32_t now_ms)
         break;
 
     case SQUAT_STATE_BOTTOM:
-        if (squat_baseline_init && (delta < (SQUAT_BOTTOM_DELTA / 2.0f)))
+        if (squat_baseline_init && (delta < (SQUAT_BOTTOM_DELTA * SQUAT_LEAVE_BOTTOM_MULT)))
         {
             squat_state_hold_count++;
             if (squat_state_hold_count >= MIN_STATE_HOLD)
@@ -477,7 +527,7 @@ void Squat_Update(int value, uint32_t now_ms)
         break;
 
     case SQUAT_STATE_GOING_UP:
-        if (squat_baseline_init && (delta <= (SQUAT_DOWN_DELTA / 2.0f)))
+        if (squat_baseline_init && (delta <= (SQUAT_DOWN_DELTA * SQUAT_STANDING_DONE_MULT)))
         {
             /* compute ROM and decide whether to count */
             float rom = squat_baseline_ay - squat_min_ay;
@@ -531,7 +581,7 @@ void Pushup_Update(int value, uint32_t now_ms)
             pushup_state = PUSHUP_STATE_BOTTOM;
             printf("PUSHUP STATE -> BOTTOM\r\n");
         }
-        else if (value < PUSHUP_TOP_THRESHOLD)
+        else if (value < PUSHUP_TOP_ABORT_THRESHOLD)
         {
             /* Went back to top too early */
             pushup_state = PUSHUP_STATE_TOP;
@@ -549,7 +599,7 @@ void Pushup_Update(int value, uint32_t now_ms)
         break;
 
     case PUSHUP_STATE_GOING_UP:
-        if (value < PUSHUP_TOP_THRESHOLD)
+        if (value < PUSHUP_TOP_COMPLETE_THRESHOLD)
         {
             if ((now_ms - pushup_last_rep_time) > PUSHUP_REP_LOCKOUT_MS)
             {
@@ -679,6 +729,11 @@ int main(void)
     printf("Starting combined squat + push-up detection loop...\r\n");
     printf("Chest-mounted IMU mode detection enabled.\r\n");
     printf("Tune thresholds after first real test.\r\n\r\n");
+
+    /* Let SysTick / DWT advance so session_id mixes more than the first-tick value. */
+    HAL_Delay(2);
+    SessionId_InitAtBoot();
+    printf("session_id=%lu\r\n", (unsigned long)g_session_id);
     /* USER CODE END 2 */
 
     /* USER CODE BEGIN WHILE */
@@ -694,6 +749,7 @@ int main(void)
 
         if (status == HAL_OK)
         {
+            i2c_accel_fail_streak = 0;
             int raw_axis = 0;
             int filtered_axis = 0;
             const char *state_string = "UNKNOWN";
@@ -750,7 +806,13 @@ int main(void)
         }
         else
         {
-            printf("Accel read failed\r\n");
+            printf("Accel read failed status=%d\r\n", (int)status);
+            i2c_accel_fail_streak++;
+            if (i2c_accel_fail_streak >= 3U)
+            {
+                RecoverI2C1_AfterBusError();
+                i2c_accel_fail_streak = 0;
+            }
         }
 
         if (status == HAL_OK)
