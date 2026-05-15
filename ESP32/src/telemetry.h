@@ -5,6 +5,7 @@
 struct TelemetryPacket
 {
     String src = "";
+    uint32_t session_id = 0;
     uint32_t t_ms = 0;
     String mode = "";
     String state = "";
@@ -45,6 +46,8 @@ struct Telemetry
 
         Serial.print("Source: ");
         Serial.println(pkt.src);
+        Serial.print("session_id: ");
+        Serial.println((unsigned long)pkt.session_id);
         Serial.print("t_ms: ");
         Serial.println((unsigned long)pkt.t_ms);
 

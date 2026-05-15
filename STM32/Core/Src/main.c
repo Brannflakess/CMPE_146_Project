@@ -62,16 +62,19 @@ typedef enum
 /* SQUAT SETTINGS                                                             */
 /* -------------------------------------------------------------------------- */
 #define SQUAT_REP_LOCKOUT_MS 1200
-#define SQUAT_STAND_THRESHOLD 15000
-#define SQUAT_DOWN_THRESHOLD 13800
-#define SQUAT_BOTTOM_THRESHOLD 12800
-#define SQUAT_UP_THRESHOLD 13800
+/* Legacy absolute thresholds (reserved / tuning reference; squat FSM uses deltas below). */
+#define SQUAT_STAND_THRESHOLD 16000
+#define SQUAT_DOWN_THRESHOLD 13500
+#define SQUAT_BOTTOM_THRESHOLD 12000
+#define SQUAT_UP_THRESHOLD 13500
 
-/* Range/delta-based thresholds (values are in raw sensor units) */
-#define SQUAT_DOWN_DELTA 1400   /* drop from baseline to consider going down */
-#define SQUAT_BOTTOM_DELTA 2200 /* deeper drop to consider bottom */
-#define SQUAT_MIN_ROM 1200      /* minimum peak-to-peak chest travel to count rep */
+/* Range/delta-based thresholds (filtered AY units — tuned from Putty squat log, May 2026). */
+#define SQUAT_DOWN_DELTA 1200      /* start descent; log showed ~3.2k–3.5k once moving */
+#define SQUAT_BOTTOM_DELTA 1800    /* reach bottom; successful rep hit ~3.2k before BOTTOM */
+#define SQUAT_MIN_ROM 900          /* min peak-to-peak; logged rep ROM ~5100 */
 #define MIN_STATE_HOLD 2
+/* GOING_DOWN abort: log had false "abort" when delta briefly dipped vs DOWN_DELTA/2 (=700); use a tighter floor */
+#define SQUAT_DOWN_ABORT_DELTA 380
 
 typedef enum
 {
@@ -132,6 +135,12 @@ static MovingAverageFilter pushup_filter = {0};
 
 static uint32_t last_oled_update = 0;
 static uint32_t last_esp32_tx = 0;
+
+/* Monotonic per boot: new value after reset or power cycle (used as Firebase session key). */
+static uint32_t g_session_id = 0;
+
+/* I2C: consecutive MPU read failures before bus/controller recovery */
+static uint8_t i2c_accel_fail_streak = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -166,6 +175,8 @@ HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
                                       int filtered_axis,
                                       const char *state_string,
                                       uint32_t now_ms);
+static void SessionId_InitAtBoot(void);
+static void RecoverI2C1_AfterBusError(void);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
@@ -186,6 +197,36 @@ HAL_StatusTypeDef UART1_SendString(const char *msg)
     return HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)len, 100);
 }
 
+static void RecoverI2C1_AfterBusError(void)
+{
+    (void)HAL_I2C_DeInit(&hi2c1);
+    HAL_Delay(5);
+    MX_I2C1_Init();
+    printf("I2C1 bus recovery (DeInit + MX_I2C1_Init)\r\n");
+}
+
+static void SessionId_InitAtBoot(void)
+{
+    /* DWT cycle counter + SysTick vary each reset/power-on; HAL_GetTick() is often ~0 here
+     * if called early — mixing avoids repeating the same session_id after unplug/replug. */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    uint32_t uid = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
+    uint32_t csr = RCC->CSR;
+    uint32_t cy = DWT->CYCCNT;
+    uint32_t tick = (uint32_t)HAL_GetTick();
+    uint32_t systick = SysTick->VAL;
+
+    g_session_id = uid ^ csr ^ cy ^ (tick * 0x9E3779B9u) ^ (systick << 17) ^ (systick >> 3);
+    if (g_session_id == 0U)
+    {
+        g_session_id = 1U;
+    }
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+}
+
 HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
                                       int16_t ay,
                                       int16_t az,
@@ -194,10 +235,11 @@ HAL_StatusTypeDef ESP32_SendTelemetry(int16_t ax,
                                       const char *state_string,
                                       uint32_t now_ms)
 {
-    char packet[256];
+    char packet[320];
     int written = snprintf(packet,
                            sizeof(packet),
-                           "{\"src\":\"stm32\",\"t_ms\":%lu,\"mode\":\"%s\",\"state\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"squat_count\":%lu,\"pushup_count\":%lu,\"oled_mode\":\"%s\",\"oled_squats\":%lu,\"oled_pushups\":%lu}\r\n",
+                           "{\"src\":\"stm32\",\"session_id\":%lu,\"t_ms\":%lu,\"mode\":\"%s\",\"state\":\"%s\",\"ax\":%d,\"ay\":%d,\"az\":%d,\"raw\":%d,\"filtered\":%d,\"squat_count\":%lu,\"pushup_count\":%lu,\"oled_mode\":\"%s\",\"oled_squats\":%lu,\"oled_pushups\":%lu}\r\n",
+                           (unsigned long)g_session_id,
                            (unsigned long)now_ms,
                            ExerciseMode_ToString(current_mode),
                            state_string,
@@ -449,7 +491,7 @@ void Squat_Update(int value, uint32_t now_ms)
                 printf("SQUAT STATE -> BOTTOM (delta=%.0f)\r\n", delta);
             }
         }
-        else if (squat_baseline_init && (delta < (SQUAT_DOWN_DELTA / 2.0f)))
+        else if (squat_baseline_init && (delta < (float)SQUAT_DOWN_ABORT_DELTA))
         {
             /* aborted descent */
             squat_state = SQUAT_STATE_STANDING;
@@ -679,6 +721,11 @@ int main(void)
     printf("Starting combined squat + push-up detection loop...\r\n");
     printf("Chest-mounted IMU mode detection enabled.\r\n");
     printf("Tune thresholds after first real test.\r\n\r\n");
+
+    /* Let SysTick / DWT advance so session_id mixes more than the first-tick value. */
+    HAL_Delay(2);
+    SessionId_InitAtBoot();
+    printf("session_id=%lu\r\n", (unsigned long)g_session_id);
     /* USER CODE END 2 */
 
     /* USER CODE BEGIN WHILE */
@@ -694,6 +741,7 @@ int main(void)
 
         if (status == HAL_OK)
         {
+            i2c_accel_fail_streak = 0;
             int raw_axis = 0;
             int filtered_axis = 0;
             const char *state_string = "UNKNOWN";
@@ -750,7 +798,13 @@ int main(void)
         }
         else
         {
-            printf("Accel read failed\r\n");
+            printf("Accel read failed status=%d\r\n", (int)status);
+            i2c_accel_fail_streak++;
+            if (i2c_accel_fail_streak >= 3U)
+            {
+                RecoverI2C1_AfterBusError();
+                i2c_accel_fail_streak = 0;
+            }
         }
 
         if (status == HAL_OK)

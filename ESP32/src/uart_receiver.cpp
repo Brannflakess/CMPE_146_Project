@@ -28,6 +28,7 @@ void UartReceiver::parseJsonLine(const char *json, TelemetryPacket &out)
     out.errorMsg = "";
 
     out.src = String((const char *)(doc["src"] | ""));
+    out.session_id = doc["session_id"].as<uint32_t>();
     out.t_ms = doc["t_ms"] | 0;
     out.mode = String((const char *)(doc["mode"] | "UNKNOWN"));
     out.state = String((const char *)(doc["state"] | "UNKNOWN"));
