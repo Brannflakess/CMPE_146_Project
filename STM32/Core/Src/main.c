@@ -38,18 +38,11 @@ UART_HandleTypeDef huart2;
 /* EXERCISE MODE DETECTION                                                    */
 /* -------------------------------------------------------------------------- */
 /*
- * Assumption for chest-mounted vertical board:
- *
- * - Standing upright for squats:
- *     |AY| tends to be large (near 1g), while |AZ| is smaller
- *
- * - Horizontal body position for push-ups:
- *     |AZ| tends to be large (near 1g), while |AY| is smaller
- *
- * These values are placeholders and should be tuned from real logs.
+ * Chest-mounted board: during real motion, |AY| and |AZ| are often BOTH large.
+ * Use *dominant axis* (larger |accel| wins by margin) once total tilt is strong enough.
  */
-#define MODE_GRAVITY_HIGH 13000
-#define MODE_GRAVITY_LOW 9000
+#define MODE_GRAVITY_HIGH 9500       /* min(|AY|,|AZ|) max — "enough tilt" to pick squat vs push-up */
+#define MODE_AXIS_DOMINANCE_MARGIN 800 /* dominant axis must exceed the other by this (raw units) */
 
 typedef enum
 {
@@ -61,20 +54,23 @@ typedef enum
 /* -------------------------------------------------------------------------- */
 /* SQUAT SETTINGS                                                             */
 /* -------------------------------------------------------------------------- */
-#define SQUAT_REP_LOCKOUT_MS 1200
-/* Legacy absolute thresholds (reserved / tuning reference; squat FSM uses deltas below). */
-#define SQUAT_STAND_THRESHOLD 16000
-#define SQUAT_DOWN_THRESHOLD 13500
-#define SQUAT_BOTTOM_THRESHOLD 12000
-#define SQUAT_UP_THRESHOLD 13500
+#define SQUAT_REP_LOCKOUT_MS 1000
+#define SQUAT_STAND_THRESHOLD 15000
+#define SQUAT_DOWN_THRESHOLD 13800
+#define SQUAT_BOTTOM_THRESHOLD 12800
+#define SQUAT_UP_THRESHOLD 13800
 
-/* Range/delta-based thresholds (filtered AY units — tuned from Putty squat log, May 2026). */
-#define SQUAT_DOWN_DELTA 1200      /* start descent; log showed ~3.2k–3.5k once moving */
-#define SQUAT_BOTTOM_DELTA 1800    /* reach bottom; successful rep hit ~3.2k before BOTTOM */
-#define SQUAT_MIN_ROM 900          /* min peak-to-peak; logged rep ROM ~5100 */
+/* Range/delta-based thresholds (filtered AY). Lower = easier partial squats. */
+#define SQUAT_DOWN_DELTA 900       /* start descent with less drop from baseline */
+#define SQUAT_BOTTOM_DELTA 1500    /* register bottom with less depth */
+#define SQUAT_MIN_ROM 650          /* count smaller ROM reps */
 #define MIN_STATE_HOLD 2
-/* GOING_DOWN abort: log had false "abort" when delta briefly dipped vs DOWN_DELTA/2 (=700); use a tighter floor */
-#define SQUAT_DOWN_ABORT_DELTA 380
+/* GOING_DOWN: abort only when nearly upright again (lower = fewer false aborts) */
+#define SQUAT_DOWN_ABORT_DELTA 280
+/* Leaving BOTTOM: fraction of BOTTOM_DELTA (higher = easier / shallower squat) */
+#define SQUAT_LEAVE_BOTTOM_MULT 0.72f
+/* GOING_UP -> STANDING: fraction of DOWN_DELTA (higher = finish rep before fully upright) */
+#define SQUAT_STANDING_DONE_MULT 0.82f
 
 typedef enum
 {
@@ -87,12 +83,20 @@ typedef enum
 /* -------------------------------------------------------------------------- */
 /* PUSH-UP SETTINGS                                                           */
 /* -------------------------------------------------------------------------- */
-#define PUSHUP_REP_LOCKOUT_MS 900
+#define PUSHUP_REP_LOCKOUT_MS 500
 
-#define PUSHUP_TOP_THRESHOLD -16500
-#define PUSHUP_DOWN_THRESHOLD -15500
-#define PUSHUP_BOTTOM_THRESHOLD -14200
-#define PUSHUP_UP_THRESHOLD -15200
+/*
+ * Filtered AZ (raw units). "Going down" = less negative; BOTTOM needs value > BOTTOM_THRESHOLD.
+ * If BOTTOM is too close to 0 (e.g. -9800) but your filtered trace only reaches ~-11k, BOTTOM never triggers.
+ *
+ * TOP_ABORT: while lowering — very negative = cancel rep.
+ * TOP_COMPLETE: while pressing up — shallow lock-out still counts.
+ */
+#define PUSHUP_TOP_ABORT_THRESHOLD -20600
+#define PUSHUP_TOP_COMPLETE_THRESHOLD -13600
+#define PUSHUP_DOWN_THRESHOLD -13200
+#define PUSHUP_BOTTOM_THRESHOLD -13600
+#define PUSHUP_UP_THRESHOLD -10200
 
 typedef enum
 {
@@ -385,23 +389,27 @@ void MovingAverage_Reset(MovingAverageFilter *f)
 /* -------------------------------------------------------------------------- */
 ExerciseMode Detect_ExerciseMode(int16_t ax, int16_t ay, int16_t az)
 {
-    (void)ax; /* not used yet */
+    (void)ax;
 
     int abs_ay = abs(ay);
     int abs_az = abs(az);
+    const int max_axis = (abs_ay > abs_az) ? abs_ay : abs_az;
 
-    if ((abs_ay > MODE_GRAVITY_HIGH) && (abs_az < MODE_GRAVITY_LOW))
-    {
-        return EXERCISE_SQUAT;
-    }
-    else if ((abs_az > MODE_GRAVITY_HIGH) && (abs_ay < MODE_GRAVITY_LOW))
-    {
-        return EXERCISE_PUSHUP;
-    }
-    else
+    if (max_axis <= MODE_GRAVITY_HIGH)
     {
         return EXERCISE_UNKNOWN;
     }
+
+    if (abs_ay > (abs_az + MODE_AXIS_DOMINANCE_MARGIN))
+    {
+        return EXERCISE_SQUAT;
+    }
+    if (abs_az > (abs_ay + MODE_AXIS_DOMINANCE_MARGIN))
+    {
+        return EXERCISE_PUSHUP;
+    }
+
+    return EXERCISE_UNKNOWN;
 }
 
 void Update_Mode_Lock(ExerciseMode detected_mode, uint32_t now_ms)
@@ -502,7 +510,7 @@ void Squat_Update(int value, uint32_t now_ms)
         break;
 
     case SQUAT_STATE_BOTTOM:
-        if (squat_baseline_init && (delta < (SQUAT_BOTTOM_DELTA / 2.0f)))
+        if (squat_baseline_init && (delta < (SQUAT_BOTTOM_DELTA * SQUAT_LEAVE_BOTTOM_MULT)))
         {
             squat_state_hold_count++;
             if (squat_state_hold_count >= MIN_STATE_HOLD)
@@ -519,7 +527,7 @@ void Squat_Update(int value, uint32_t now_ms)
         break;
 
     case SQUAT_STATE_GOING_UP:
-        if (squat_baseline_init && (delta <= (SQUAT_DOWN_DELTA / 2.0f)))
+        if (squat_baseline_init && (delta <= (SQUAT_DOWN_DELTA * SQUAT_STANDING_DONE_MULT)))
         {
             /* compute ROM and decide whether to count */
             float rom = squat_baseline_ay - squat_min_ay;
@@ -573,7 +581,7 @@ void Pushup_Update(int value, uint32_t now_ms)
             pushup_state = PUSHUP_STATE_BOTTOM;
             printf("PUSHUP STATE -> BOTTOM\r\n");
         }
-        else if (value < PUSHUP_TOP_THRESHOLD)
+        else if (value < PUSHUP_TOP_ABORT_THRESHOLD)
         {
             /* Went back to top too early */
             pushup_state = PUSHUP_STATE_TOP;
@@ -591,7 +599,7 @@ void Pushup_Update(int value, uint32_t now_ms)
         break;
 
     case PUSHUP_STATE_GOING_UP:
-        if (value < PUSHUP_TOP_THRESHOLD)
+        if (value < PUSHUP_TOP_COMPLETE_THRESHOLD)
         {
             if ((now_ms - pushup_last_rep_time) > PUSHUP_REP_LOCKOUT_MS)
             {
